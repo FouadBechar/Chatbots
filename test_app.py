@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import requests
+from redis.exceptions import RedisError
 
-from app import InMemoryRateLimiter, create_app
+from app import InMemoryRateLimiter, RedisRateLimiter, create_app
 
 
 class FakeResponse:
@@ -41,6 +43,60 @@ class FakeSession:
         return self.response
 
 
+class FakeRedisPipeline:
+    def __init__(self, redis_client):
+        self.redis_client = redis_client
+        self.key = None
+        self.now = None
+        self.window_seconds = None
+        self.member = None
+
+    def zremrangebyscore(self, key, _min_score, max_score):
+        self.key = key
+        self.now = max_score
+        return self
+
+    def zcard(self, key):
+        self.key = key
+        return self
+
+    def zadd(self, key, mapping):
+        self.key = key
+        self.member = next(iter(mapping.keys()))
+        self.now = next(iter(mapping.values()))
+        return self
+
+    def expire(self, key, window_seconds):
+        self.key = key
+        self.window_seconds = window_seconds
+        return self
+
+    def execute(self):
+        bucket = self.redis_client.buckets.setdefault(self.key, {})
+        min_score = self.now - self.window_seconds
+        bucket = {member: score for member, score in bucket.items() if score > min_score}
+        self.redis_client.buckets[self.key] = bucket
+        current_count = len(bucket)
+        bucket[self.member] = self.now
+        return [0, current_count, 1, True]
+
+
+class FakeRedisClient:
+    def __init__(self, should_fail=False):
+        self.should_fail = should_fail
+        self.buckets = {}
+
+    def ping(self):
+        if self.should_fail:
+            raise RedisError("Redis unavailable")
+
+    def pipeline(self):
+        return FakeRedisPipeline(self)
+
+    def zrem(self, key, member):
+        self.buckets.setdefault(key, {}).pop(member, None)
+
+
 def make_app(session=None, rate_limiter=None):
     app = create_app(session=session, rate_limiter=rate_limiter)
     app.config.update(
@@ -52,6 +108,13 @@ def make_app(session=None, rate_limiter=None):
 
 
 class AppTestCase(unittest.TestCase):
+    def setUp(self):
+        self.env_patcher = patch.dict("os.environ", {}, clear=True)
+        self.env_patcher.start()
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
     def test_health_reports_configuration(self):
         client = make_app().test_client()
 
@@ -129,6 +192,26 @@ class AppTestCase(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.get_json()["error"]["code"], "rate_limited")
+
+    def test_redis_rate_limiter_is_used_when_redis_url_is_configured(self):
+        fake_redis = FakeRedisClient()
+
+        with patch("app.Redis.from_url", return_value=fake_redis):
+            with patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379/0"}, clear=False):
+                app = create_app(session=FakeSession())
+
+        self.assertIsInstance(app.extensions["rate_limiter"], RedisRateLimiter)
+        self.assertEqual(app.extensions["rate_limiter_backend"], "RedisRateLimiter")
+
+    def test_redis_failure_falls_back_to_in_memory_rate_limiter(self):
+        fake_redis = FakeRedisClient(should_fail=True)
+
+        with patch("app.Redis.from_url", return_value=fake_redis):
+            with patch.dict("os.environ", {"REDIS_URL": "redis://localhost:6379/0"}, clear=False):
+                app = create_app(session=FakeSession())
+
+        self.assertIsInstance(app.extensions["rate_limiter"], InMemoryRateLimiter)
+        self.assertEqual(app.extensions["rate_limiter_backend"], "InMemoryRateLimiter")
 
 
 if __name__ == "__main__":

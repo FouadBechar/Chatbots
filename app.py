@@ -6,6 +6,8 @@ from collections import defaultdict, deque
 from ipaddress import ip_address
 
 import requests
+from redis import Redis
+from redis.exceptions import RedisError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -27,6 +29,34 @@ class InMemoryRateLimiter:
             return False
 
         bucket.append(now)
+        return True
+
+
+class RedisRateLimiter:
+    """Shared rate limiter backed by Redis for multi-process deployments."""
+
+    def __init__(self, client: Redis, key_prefix: str = "chatbots:rate_limit"):
+        self._client = client
+        self._key_prefix = key_prefix
+
+    def _bucket_key(self, client_id: str) -> str:
+        return f"{self._key_prefix}:{client_id}"
+
+    def allow(self, client_id: str, now: float, limit: int, window_seconds: int) -> bool:
+        key = self._bucket_key(client_id)
+        pipeline = self._client.pipeline()
+        min_score = now - window_seconds
+
+        pipeline.zremrangebyscore(key, 0, min_score)
+        pipeline.zcard(key)
+        pipeline.zadd(key, {str(now): now})
+        pipeline.expire(key, max(window_seconds, 1))
+        _, current_count, _, _ = pipeline.execute()
+
+        if current_count >= limit:
+            self._client.zrem(key, str(now))
+            return False
+
         return True
 
 
@@ -98,6 +128,20 @@ def build_upstream_headers(api_key: str):
     }
 
 
+def configure_rate_limiter(app) -> tuple[object, str]:
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        return InMemoryRateLimiter(), "InMemoryRateLimiter"
+
+    try:
+        redis_client = Redis.from_url(redis_url, decode_responses=True)
+        redis_client.ping()
+        return RedisRateLimiter(redis_client), "RedisRateLimiter"
+    except RedisError as redis_error:
+        app.logger.warning("redis_rate_limiter_unavailable error=%s", redis_error)
+        return InMemoryRateLimiter(), "InMemoryRateLimiter"
+
+
 def create_app(session: requests.Session | None = None, rate_limiter: InMemoryRateLimiter | None = None):
     app = Flask(__name__)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -125,18 +169,23 @@ def create_app(session: requests.Session | None = None, rate_limiter: InMemoryRa
     app.logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
     app.extensions["http_session"] = session or requests.Session()
-    app.extensions["rate_limiter"] = rate_limiter or InMemoryRateLimiter()
+    if rate_limiter is not None:
+        app.extensions["rate_limiter"] = rate_limiter
+        app.extensions["rate_limiter_backend"] = rate_limiter.__class__.__name__
+    else:
+        resolved_rate_limiter, backend_name = configure_rate_limiter(app)
+        app.extensions["rate_limiter"] = resolved_rate_limiter
+        app.extensions["rate_limiter_backend"] = backend_name
 
     @app.get("/health")
     def health():
         has_api_key = bool(app.config["API_KEY"])
-        rate_limiter_backend = app.extensions["rate_limiter"].__class__.__name__
         return (
             jsonify(
                 {
                     "status": "ok",
                     "api_key_configured": has_api_key,
-                    "rate_limiter_backend": rate_limiter_backend,
+                    "rate_limiter_backend": app.extensions["rate_limiter_backend"],
                 }
             ),
             (200 if has_api_key else 503),
